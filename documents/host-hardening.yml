@@ -1,0 +1,149 @@
+schemaVersion: '2.2'
+description: |-
+  Converges a managed node onto a small, high-value host hardening baseline: remote root
+  login and password authentication are turned off on Linux, and the legacy SMB1 protocol
+  is disabled on Windows.
+
+  Every change is made idempotently and validated before it is adopted. The Linux step
+  writes to a temporary copy, runs the sshd configuration test against it, and only then
+  replaces the live file and reloads the daemon; if validation fails the original file is
+  left untouched and the step exits non-zero. Because this document changes host
+  configuration it is intended to be reviewed and adopted deliberately rather than enabled
+  by default.
+parameters:
+  permitRootLogin:
+    type: String
+    description: Value to enforce for the sshd PermitRootLogin directive.
+    default: 'no'
+    allowedValues:
+      - 'no'
+      - prohibit-password
+  passwordAuthentication:
+    type: String
+    description: Value to enforce for the sshd PasswordAuthentication directive.
+    default: 'no'
+    allowedValues:
+      - 'no'
+      - 'yes'
+  sshdConfigPath:
+    type: String
+    description: Path to the sshd configuration file to converge.
+    default: /etc/ssh/sshd_config
+    allowedPattern: ^/[A-Za-z0-9._/-]{1,128}$
+  disableSmb1:
+    type: String
+    description: Whether the legacy SMB1 server protocol should be disabled on Windows nodes.
+    default: 'true'
+    allowedValues:
+      - 'true'
+      - 'false'
+mainSteps:
+  - action: aws:runShellScript
+    name: hardenLinuxSshd
+    precondition:
+      StringEquals:
+        - platformType
+        - Linux
+    inputs:
+      timeoutSeconds: '600'
+      runCommand:
+        - |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          CONFIG="{{ sshdConfigPath }}"
+          PERMIT_ROOT="{{ permitRootLogin }}"
+          PASSWORD_AUTH="{{ passwordAuthentication }}"
+
+          if [ ! -f "$CONFIG" ]; then
+            echo "sshd configuration $CONFIG is not present; nothing to converge"
+            exit 0
+          fi
+          if ! command -v sshd >/dev/null 2>&1 && [ ! -x /usr/sbin/sshd ]; then
+            echo "sshd binary is not available; nothing to converge"
+            exit 0
+          fi
+          SSHD_BIN="$(command -v sshd || echo /usr/sbin/sshd)"
+
+          workdir="$(mktemp -d)"
+          candidate="$workdir/sshd_config"
+          trap 'rm -rf "$workdir"' EXIT
+          cp -p "$CONFIG" "$candidate"
+
+          # Rewrite the directive in place when present (including a commented form), and
+          # append it when the file never mentions it. Either way the file ends up with
+          # exactly one active occurrence.
+          set_directive() {
+            local key="$1" value="$2"
+            if grep -Eqi "^[[:space:]]*#?[[:space:]]*${key}[[:space:]]+" "$candidate"; then
+              sed -ri "s|^[[:space:]]*#?[[:space:]]*(${key})[[:space:]]+.*$|\1 ${value}|I" "$candidate"
+            else
+              printf '%s %s\n' "$key" "$value" >> "$candidate"
+            fi
+          }
+
+          set_directive "PermitRootLogin" "$PERMIT_ROOT"
+          set_directive "PasswordAuthentication" "$PASSWORD_AUTH"
+
+          if cmp -s "$CONFIG" "$candidate"; then
+            echo "sshd configuration already matches the baseline; no change made"
+            exit 0
+          fi
+
+          if ! "$SSHD_BIN" -t -f "$candidate"; then
+            echo "ERROR: the converged sshd configuration failed validation; original left in place" >&2
+            exit 1
+          fi
+
+          backup="${CONFIG}.bak.$(date -u +%Y%m%dT%H%M%SZ)"
+          cp -p "$CONFIG" "$backup"
+          cat "$candidate" > "$CONFIG"
+          echo "sshd configuration updated; previous file kept at $backup"
+
+          # A reload keeps established sessions alive; a restart would not.
+          if command -v systemctl >/dev/null 2>&1; then
+            unit="sshd"
+            systemctl list-unit-files "${unit}.service" >/dev/null 2>&1 || unit="ssh"
+            systemctl reload "$unit" || systemctl restart "$unit"
+            echo "reloaded ${unit}.service"
+          else
+            echo "systemd not present; reload the ssh daemon through this platform's init system"
+          fi
+
+  - action: aws:runPowerShellScript
+    name: hardenWindowsSmb
+    precondition:
+      StringEquals:
+        - platformType
+        - Windows
+    inputs:
+      timeoutSeconds: '600'
+      runCommand:
+        - |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+
+          if ('{{ disableSmb1 }}' -ne 'true') {
+              Write-Output 'SMB1 convergence is turned off for this node'
+              exit 0
+          }
+
+          $config = Get-SmbServerConfiguration -ErrorAction SilentlyContinue
+          if ($null -eq $config) {
+              Write-Output 'SMB server configuration is unavailable on this node; nothing to converge'
+              exit 0
+          }
+
+          if ($config.EnableSMB1Protocol -eq $false) {
+              Write-Output 'SMB1 is already disabled; no change made'
+              exit 0
+          }
+
+          Set-SmbServerConfiguration -EnableSMB1Protocol $false -Force
+          $config = Get-SmbServerConfiguration
+          if ($config.EnableSMB1Protocol -eq $true) {
+              Write-Error 'SMB1 is still enabled after convergence'
+              exit 1
+          }
+
+          Write-Output 'SMB1 disabled'

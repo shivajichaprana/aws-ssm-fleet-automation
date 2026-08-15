@@ -1,0 +1,160 @@
+schemaVersion: '2.2'
+description: |-
+  Collects a read-only health snapshot from a managed node: SSM Agent version, uptime,
+  utilisation of a chosen filesystem, memory pressure, and whether the host is waiting on
+  a reboot.
+
+  The document changes no state, so it is safe to schedule frequently and safe to run
+  against production nodes at any time. A node whose filesystem utilisation reaches the
+  supplied threshold exits non-zero on purpose: State Manager then records the node as
+  non-compliant rather than silently succeeding, which is the point of scheduling it.
+parameters:
+  linuxMountPoint:
+    type: String
+    description: Filesystem mount point to report utilisation for on Linux nodes.
+    default: /
+    allowedPattern: ^/[A-Za-z0-9._/-]{0,63}$|^/$
+  windowsDriveLetter:
+    type: String
+    description: Drive to report utilisation for on Windows nodes, including the colon.
+    default: 'C:'
+    allowedPattern: ^[A-Za-z]:$
+  utilisationWarnPercent:
+    type: String
+    description: Utilisation percentage at or above which the node is reported as degraded.
+    default: '85'
+    allowedPattern: ^([1-9][0-9]?|100)$
+mainSteps:
+  - action: aws:runShellScript
+    name: linuxDiagnostics
+    precondition:
+      StringEquals:
+        - platformType
+        - Linux
+    inputs:
+      timeoutSeconds: '300'
+      runCommand:
+        - |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          MOUNT="{{ linuxMountPoint }}"
+          WARN="{{ utilisationWarnPercent }}"
+
+          agent_version() {
+            if command -v amazon-ssm-agent >/dev/null 2>&1; then
+              amazon-ssm-agent -version 2>/dev/null | head -n 1 | tr -d '\r'
+            else
+              echo "not-found"
+            fi
+          }
+
+          # Debian marks a pending reboot with a sentinel file; RHEL family answers
+          # through needs-restarting. Absence of both tools is reported, not assumed.
+          reboot_pending() {
+            if [ -f /var/run/reboot-required ]; then
+              echo "yes"
+            elif command -v needs-restarting >/dev/null 2>&1; then
+              if needs-restarting -r >/dev/null 2>&1; then echo "no"; else echo "yes"; fi
+            else
+              echo "unknown"
+            fi
+          }
+
+          if ! disk_used=$(df -P "$MOUNT" 2>/dev/null | awk 'NR == 2 { gsub(/%/, "", $5); print $5 }'); then
+            echo "ERROR: mount point $MOUNT is not present on this node" >&2
+            exit 1
+          fi
+          [ -n "$disk_used" ] || { echo "ERROR: could not read utilisation for $MOUNT" >&2; exit 1; }
+
+          mem_used=$(awk '/MemTotal/ { total = $2 } /MemAvailable/ { avail = $2 }
+                          END { if (total > 0) printf "%d", ((total - avail) * 100) / total; else print 0 }' \
+                     /proc/meminfo)
+
+          echo "hostname=$(hostname)"
+          echo "kernel=$(uname -r)"
+          echo "uptime_seconds=$(awk '{ printf "%d", $1 }' /proc/uptime)"
+          echo "ssm_agent_version=$(agent_version)"
+          echo "mount=$MOUNT"
+          echo "disk_used_percent=$disk_used"
+          echo "memory_used_percent=$mem_used"
+          echo "reboot_pending=$(reboot_pending)"
+
+          degraded=0
+          if [ "$disk_used" -ge "$WARN" ]; then
+            echo "DEGRADED: $MOUNT is ${disk_used}% used, at or above the ${WARN}% threshold" >&2
+            degraded=1
+          fi
+          if [ "$mem_used" -ge "$WARN" ]; then
+            echo "DEGRADED: memory is ${mem_used}% used, at or above the ${WARN}% threshold" >&2
+            degraded=1
+          fi
+
+          exit "$degraded"
+
+  - action: aws:runPowerShellScript
+    name: windowsDiagnostics
+    precondition:
+      StringEquals:
+        - platformType
+        - Windows
+    inputs:
+      timeoutSeconds: '300'
+      runCommand:
+        - |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+
+          $drive = '{{ windowsDriveLetter }}'
+          $warn  = [int]'{{ utilisationWarnPercent }}'
+
+          $disk = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='$drive'"
+          if ($null -eq $disk -or $disk.Size -le 0) {
+              Write-Error "Drive $drive is not present on this node"
+              exit 1
+          }
+          $diskUsed = [int]((($disk.Size - $disk.FreeSpace) / $disk.Size) * 100)
+
+          $os      = Get-CimInstance -ClassName Win32_OperatingSystem
+          $memUsed = [int]((($os.TotalVisibleMemorySize - $os.FreePhysicalMemory) / $os.TotalVisibleMemorySize) * 100)
+          $uptime  = [int]((Get-Date) - $os.LastBootUpTime).TotalSeconds
+
+          $agentService = Get-Service -Name 'AmazonSSMAgent' -ErrorAction SilentlyContinue
+          $agentVersion = 'not-found'
+          if ($agentService) {
+              $agentPath = Join-Path $env:ProgramFiles 'Amazon\SSM\amazon-ssm-agent.exe'
+              if (Test-Path -Path $agentPath) {
+                  $agentVersion = (Get-Item -Path $agentPath).VersionInfo.ProductVersion
+              }
+          }
+
+          # Any one of these keys is Windows saying a restart is outstanding.
+          $rebootKeys = @(
+              'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
+              'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
+          )
+          $rebootPending = 'no'
+          foreach ($key in $rebootKeys) {
+              if (Test-Path -Path $key) { $rebootPending = 'yes'; break }
+          }
+
+          Write-Output "hostname=$env:COMPUTERNAME"
+          Write-Output "os_version=$($os.Version)"
+          Write-Output "uptime_seconds=$uptime"
+          Write-Output "ssm_agent_version=$agentVersion"
+          Write-Output "drive=$drive"
+          Write-Output "disk_used_percent=$diskUsed"
+          Write-Output "memory_used_percent=$memUsed"
+          Write-Output "reboot_pending=$rebootPending"
+
+          $degraded = 0
+          if ($diskUsed -ge $warn) {
+              Write-Error "DEGRADED: $drive is $diskUsed% used, at or above the $warn% threshold"
+              $degraded = 1
+          }
+          if ($memUsed -ge $warn) {
+              Write-Error "DEGRADED: memory is $memUsed% used, at or above the $warn% threshold"
+              $degraded = 1
+          }
+
+          exit $degraded

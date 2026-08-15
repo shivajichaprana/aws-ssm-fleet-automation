@@ -13,8 +13,8 @@ described as data and applied consistently across every node in the fleet.
 | Inventory and compliance | Systems Manager Inventory with a resource data sync so fleet state is queryable outside the console |
 | Interactive access | Session Manager with hardened, audited logging in place of inbound SSH and bastion hosts |
 
-Patching ships first; the remaining capabilities land in the same configuration and reuse
-the same tagging model.
+Patch management and configuration convergence ship today; inventory and interactive
+access land in the same configuration and reuse the same tagging model.
 
 ## How nodes are selected
 
@@ -38,7 +38,55 @@ tags = {
 | `providers.tf` | Regional provider with default tags |
 | `variables.tf` | Fleet configuration surface: baselines, windows, retention, roles |
 | `patch-baselines.tf` | Patch baselines, patch groups, maintenance windows and their tasks |
+| `state-manager.tf` | Published Command documents and the State Manager associations that run them |
+| `documents/` | Run Command documents published to Systems Manager, one per file |
 | `outputs.tf` | Identifiers other configurations and runbooks consume |
+
+## Configuration convergence
+
+A maintenance window patches the fleet on a cadence. An association does something
+different: it keeps re-asserting a declared state, and reports a node that has drifted away
+from it as non-compliant. Both are described the same way — a document, a tag-selected
+slice of the fleet, a schedule, and a rate limit.
+
+Every `*.yml` file in [`documents/`](documents/) is published as a Command document
+automatically, so a new one is added to the fleet by adding a file. Associations reference
+either a published document (`local_document`) or an AWS-managed one (`document_name`).
+
+| Association | Document | Cadence | Effect |
+|---|---|---|---|
+| `agent-update` | `AWS-UpdateSSMAgent` | Every 14 days | Keeps the agent current so every other capability keeps working |
+| `patch-scan` | `AWS-RunPatchBaseline` | Daily | Reports patch compliance between install windows without changing the node |
+| `service-convergence` | `service-convergence` | Hourly | Holds the agent services at enabled and running |
+| `fleet-diagnostics` | `fleet-diagnostics` | Twice daily | Surfaces a host low on disk or memory as non-compliant |
+| `host-hardening` | `host-hardening` | Weekly, **off by default** | Converges hosts onto the ssh and SMB hardening baseline |
+
+An association carrying `enabled = false` stays described in configuration but is not
+created. That is how a document which rewrites host configuration ships ready to adopt
+rather than switched on — review the values, flip the flag, and apply.
+
+```hcl
+state_manager_associations = {
+  host-hardening = {
+    local_document              = "host-hardening"
+    schedule_expression         = "cron(0 5 ? * SUN *)"
+    apply_only_at_cron_interval = true
+    max_concurrency             = "5%"
+    max_errors                  = "1"
+    enabled                     = true
+
+    targets = [
+      {
+        key    = "tag:Patch Group"
+        values = ["linux-non-production"]
+      },
+    ]
+  }
+}
+```
+
+Systems Manager truncates the output it returns inline. Set `association_output_s3_bucket`
+to an existing bucket to keep the full log of every run.
 
 ## Getting started
 
@@ -90,6 +138,9 @@ module "fleet" {
   budget so a bad patch stops rather than sweeps the fleet.
 - **Auditable output.** Patch command output is captured to CloudWatch Logs with an
   explicit retention period and optional customer managed encryption.
+- **Idempotent convergence.** A document run against a node already in the declared state
+  makes no change and succeeds, so a short association interval is safe. A node that did
+  not converge exits non-zero and shows up as non-compliant.
 - **Templates, not device operations.** This repository ships infrastructure as code with
   placeholder values; it is never executed against a live account from here.
 

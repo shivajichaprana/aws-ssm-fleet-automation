@@ -362,3 +362,247 @@ variable "maintenance_window_role_arn" {
     error_message = "maintenance_window_role_arn must be an IAM role ARN or null."
   }
 }
+
+variable "state_manager_associations" {
+  description = <<-EOT
+    State Manager associations that hold the fleet at its declared state. Each association
+    binds one document to a tag-selected slice of the fleet on a schedule.
+
+    Exactly one of document_name or local_document must be set. Use document_name for an
+    AWS-managed or externally owned document, and local_document for one of the documents
+    shipped in this repository (the map key of the file in documents/, without its
+    extension).
+
+    An association with enabled = false is described here but not created, which is how a
+    document that changes host configuration ships ready to adopt rather than switched on.
+  EOT
+
+  type = map(object({
+    document_name    = optional(string)
+    local_document   = optional(string)
+    association_name = optional(string)
+    document_version = optional(string)
+    description      = optional(string)
+
+    schedule_expression = optional(string)
+    schedule_offset     = optional(number)
+    # When true the association runs only on its schedule, never immediately after it is
+    # created or changed. Preferred for anything that touches production nodes.
+    apply_only_at_cron_interval = optional(bool, false)
+
+    compliance_severity = optional(string, "MEDIUM")
+    sync_compliance     = optional(string, "AUTO")
+    max_concurrency     = optional(string, "10%")
+    max_errors          = optional(string, "5%")
+
+    parameters = optional(map(string), {})
+    enabled    = optional(bool, true)
+
+    targets = list(object({
+      key    = string
+      values = list(string)
+    }))
+  }))
+
+  default = {
+    agent-update = {
+      document_name       = "AWS-UpdateSSMAgent"
+      description         = "Keeps the SSM Agent current so every other capability keeps working."
+      schedule_expression = "rate(14 days)"
+      compliance_severity = "HIGH"
+      max_concurrency     = "10%"
+      max_errors          = "5%"
+
+      targets = [
+        {
+          key    = "InstanceIds"
+          values = ["*"]
+        },
+      ]
+    }
+
+    patch-scan = {
+      document_name       = "AWS-RunPatchBaseline"
+      description         = "Reports patch compliance between install windows without changing the node."
+      schedule_expression = "rate(1 day)"
+      compliance_severity = "CRITICAL"
+      max_concurrency     = "20%"
+      max_errors          = "10%"
+
+      parameters = {
+        Operation    = "Scan"
+        RebootOption = "NoReboot"
+      }
+
+      targets = [
+        {
+          key    = "InstanceIds"
+          values = ["*"]
+        },
+      ]
+    }
+
+    service-convergence = {
+      local_document              = "service-convergence"
+      description                 = "Holds the agent services at enabled and running."
+      schedule_expression         = "rate(1 hour)"
+      compliance_severity         = "HIGH"
+      apply_only_at_cron_interval = false
+      max_concurrency             = "20%"
+      max_errors                  = "10%"
+
+      targets = [
+        {
+          key    = "InstanceIds"
+          values = ["*"]
+        },
+      ]
+    }
+
+    fleet-diagnostics = {
+      local_document      = "fleet-diagnostics"
+      description         = "Reports host health so a degraded node surfaces as non-compliant."
+      schedule_expression = "rate(12 hours)"
+      compliance_severity = "MEDIUM"
+      max_concurrency     = "20%"
+      max_errors          = "20%"
+
+      parameters = {
+        utilisationWarnPercent = "85"
+      }
+
+      targets = [
+        {
+          key    = "InstanceIds"
+          values = ["*"]
+        },
+      ]
+    }
+
+    # Ships described but switched off: host hardening rewrites sshd configuration, so it
+    # is adopted deliberately after the values below have been reviewed for the fleet.
+    host-hardening = {
+      local_document              = "host-hardening"
+      description                 = "Converges hosts onto the ssh and SMB hardening baseline."
+      schedule_expression         = "cron(0 5 ? * SUN *)"
+      compliance_severity         = "HIGH"
+      apply_only_at_cron_interval = true
+      max_concurrency             = "5%"
+      max_errors                  = "1"
+      enabled                     = false
+
+      targets = [
+        {
+          key    = "tag:Patch Group"
+          values = ["linux-non-production"]
+        },
+      ]
+    }
+  }
+
+  validation {
+    condition = alltrue([
+      for a in var.state_manager_associations :
+      (a.document_name == null) != (a.local_document == null)
+    ])
+    error_message = "Each association must set exactly one of document_name or local_document."
+  }
+
+  validation {
+    condition = alltrue([
+      for a in var.state_manager_associations :
+      a.schedule_expression == null || can(regex("^(cron|rate)\\(.+\\)$", a.schedule_expression))
+    ])
+    error_message = "schedule_expression must be a cron(...) or rate(...) expression."
+  }
+
+  validation {
+    condition = alltrue([
+      for a in var.state_manager_associations :
+      contains(["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFORMATIONAL", "UNSPECIFIED"], a.compliance_severity)
+    ])
+    error_message = "compliance_severity must be one of CRITICAL, HIGH, MEDIUM, LOW, INFORMATIONAL, UNSPECIFIED."
+  }
+
+  validation {
+    condition = alltrue([
+      for a in var.state_manager_associations : contains(["AUTO", "MANUAL"], a.sync_compliance)
+    ])
+    error_message = "sync_compliance must be AUTO or MANUAL."
+  }
+
+  validation {
+    condition = alltrue([
+      for a in var.state_manager_associations :
+      can(regex("^([0-9]+|[0-9]{1,2}%|100%)$", a.max_concurrency)) &&
+      can(regex("^([0-9]+|[0-9]{1,2}%|100%)$", a.max_errors))
+    ])
+    error_message = "max_concurrency and max_errors must be an absolute count or a percentage such as 10%."
+  }
+
+  validation {
+    condition = alltrue([
+      for a in var.state_manager_associations : length(a.targets) > 0
+    ])
+    error_message = "Each association must declare at least one target."
+  }
+
+  validation {
+    condition = alltrue(flatten([
+      for a in var.state_manager_associations : [
+        for t in a.targets :
+        length(t.key) > 0 && length(t.values) > 0 && length(t.values) <= 50
+      ]
+    ]))
+    error_message = "Each association target must carry a key and between 1 and 50 values."
+  }
+
+  validation {
+    condition = alltrue([
+      for a in var.state_manager_associations :
+      a.schedule_offset == null || try(a.schedule_offset >= 1 && a.schedule_offset <= 6, false)
+    ])
+    error_message = "schedule_offset must be between 1 and 6 days when set."
+  }
+}
+
+variable "document_target_type" {
+  description = <<-EOT
+    Resource type the published Command documents may target. The default "/" permits any
+    managed node, which covers EC2 instances and hybrid activations alike; narrow it to
+    "/AWS::EC2::Instance" for an EC2-only fleet.
+  EOT
+  type        = string
+  default     = "/"
+
+  validation {
+    condition     = can(regex("^(/|/AWS::[A-Za-z0-9:]+)$", var.document_target_type))
+    error_message = "document_target_type must be \"/\" or a resource type such as /AWS::EC2::Instance."
+  }
+}
+
+variable "association_output_s3_bucket" {
+  description = <<-EOT
+    Optional existing S3 bucket that receives full association command output. Systems
+    Manager truncates output it returns inline, so a bucket is the way to keep the whole
+    log of a run. Leave null to keep output inline only.
+  EOT
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.association_output_s3_bucket == null || can(regex("^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$", var.association_output_s3_bucket))
+    error_message = "association_output_s3_bucket must be a valid S3 bucket name or null."
+  }
+}
+
+variable "association_output_s3_key_prefix" {
+  description = "Key prefix applied to association output written to S3."
+  type        = string
+  default     = "state-manager"
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9!_.*'()/-]{0,256}$", var.association_output_s3_key_prefix))
+    error_message = "association_output_s3_key_prefix must be a valid S3 key prefix."
+  }
+}

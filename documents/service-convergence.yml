@@ -1,0 +1,143 @@
+schemaVersion: '2.2'
+description: |-
+  Converges a managed node onto a declared set of running services. For every service
+  named for the node's platform the document enables it at boot and starts it if it is
+  not already running, then re-reads the service state and fails if any service is still
+  down.
+
+  The document is idempotent: on a node that is already in the declared state it makes no
+  changes and reports success, which is what lets State Manager run it on a short interval
+  without churning the fleet.
+parameters:
+  linuxServices:
+    type: StringList
+    description: systemd unit names that must be enabled and running on Linux nodes.
+    default:
+      - amazon-ssm-agent
+  windowsServices:
+    type: StringList
+    description: Windows service names that must be set to automatic start and running.
+    default:
+      - AmazonSSMAgent
+  enableOnBoot:
+    type: String
+    description: Whether a service that is running but not enabled at boot should be enabled.
+    default: 'true'
+    allowedValues:
+      - 'true'
+      - 'false'
+mainSteps:
+  - action: aws:runShellScript
+    name: convergeLinuxServices
+    precondition:
+      StringEquals:
+        - platformType
+        - Linux
+    inputs:
+      timeoutSeconds: '600'
+      runCommand:
+        - |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          RAW_SERVICES="{{ linuxServices }}"
+          ENABLE_ON_BOOT="{{ enableOnBoot }}"
+
+          if ! command -v systemctl >/dev/null 2>&1; then
+            echo "ERROR: systemd is required to converge services on this node" >&2
+            exit 1
+          fi
+
+          # A StringList arrives comma joined; strip spaces so "a, b" and "a,b" behave alike.
+          IFS=',' read -r -a services <<< "${RAW_SERVICES// /}"
+
+          failed=0
+          for service in "${services[@]}"; do
+            [ -n "$service" ] || continue
+
+            if ! systemctl list-unit-files "${service}.service" >/dev/null 2>&1 \
+               || ! systemctl cat "${service}.service" >/dev/null 2>&1; then
+              echo "ERROR: $service is not installed on this node" >&2
+              failed=1
+              continue
+            fi
+
+            if systemctl is-active --quiet "$service"; then
+              echo "$service: already running"
+            else
+              echo "$service: starting"
+              systemctl start "$service" || true
+            fi
+
+            if [ "$ENABLE_ON_BOOT" = "true" ] && ! systemctl is-enabled --quiet "$service"; then
+              echo "$service: enabling at boot"
+              systemctl enable "$service" || true
+            fi
+
+            # Re-read rather than trusting the start above, so the exit status reflects
+            # the state the node is actually in.
+            if systemctl is-active --quiet "$service"; then
+              echo "$service: converged (active=yes enabled=$(systemctl is-enabled "$service" 2>/dev/null || echo unknown))"
+            else
+              echo "ERROR: $service is still not running after convergence" >&2
+              systemctl status "$service" --no-pager --lines 20 || true
+              failed=1
+            fi
+          done
+
+          exit "$failed"
+
+  - action: aws:runPowerShellScript
+    name: convergeWindowsServices
+    precondition:
+      StringEquals:
+        - platformType
+        - Windows
+    inputs:
+      timeoutSeconds: '600'
+      runCommand:
+        - |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+
+          $raw          = '{{ windowsServices }}'
+          $enableOnBoot = '{{ enableOnBoot }}'
+
+          $services = $raw -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+          $failed = 0
+
+          foreach ($name in $services) {
+              $service = Get-Service -Name $name -ErrorAction SilentlyContinue
+              if ($null -eq $service) {
+                  Write-Error "$name is not installed on this node"
+                  $failed = 1
+                  continue
+              }
+
+              if ($service.Status -ne 'Running') {
+                  Write-Output "${name}: starting"
+                  try { Start-Service -Name $name } catch { Write-Output "${name}: start failed, $_" }
+              }
+              else {
+                  Write-Output "${name}: already running"
+              }
+
+              if ($enableOnBoot -eq 'true') {
+                  $startMode = (Get-CimInstance -ClassName Win32_Service -Filter "Name='$name'").StartMode
+                  if ($startMode -ne 'Auto') {
+                      Write-Output "${name}: setting start type to automatic"
+                      Set-Service -Name $name -StartupType Automatic
+                  }
+              }
+
+              $service.Refresh()
+              if ($service.Status -eq 'Running') {
+                  Write-Output "${name}: converged"
+              }
+              else {
+                  Write-Error "$name is still not running after convergence"
+                  $failed = 1
+              }
+          }
+
+          exit $failed

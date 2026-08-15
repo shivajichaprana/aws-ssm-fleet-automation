@@ -37,3 +37,28 @@ output "patch_log_group_name" {
   description = "CloudWatch log group that captures patch command output."
   value       = aws_cloudwatch_log_group.patch.name
 }
+
+output "ssm_document_names" {
+  description = "Published Command document names keyed by the file that defines them."
+  value       = { for key, document in aws_ssm_document.fleet : key => document.name }
+}
+
+output "ssm_document_arns" {
+  description = "Published Command document ARNs keyed by the file that defines them."
+  value       = { for key, document in aws_ssm_document.fleet : key => document.arn }
+}
+
+output "state_manager_association_ids" {
+  description = "State Manager association IDs keyed by association name."
+  value       = { for key, association in aws_ssm_association.this : key => association.association_id }
+}
+
+output "state_manager_association_documents" {
+  description = "Document each created association runs, keyed by association name."
+  value       = { for key, association in aws_ssm_association.this : key => association.name }
+}
+
+output "described_associations_not_created" {
+  description = "Associations present in configuration but switched off, so they are not created."
+  value       = sort(setsubtract(keys(var.state_manager_associations), keys(local.enabled_associations)))
+}
