@@ -13,8 +13,8 @@ described as data and applied consistently across every node in the fleet.
 | Inventory and compliance | Systems Manager Inventory with a resource data sync so fleet state is queryable outside the console |
 | Interactive access | Session Manager with hardened, audited logging in place of inbound SSH and bastion hosts |
 
-Patch management and configuration convergence ship today; inventory and interactive
-access land in the same configuration and reuse the same tagging model.
+Patch management, configuration convergence, and inventory ship today; interactive access
+lands in the same configuration and reuses the same tagging model.
 
 ## How nodes are selected
 
@@ -40,6 +40,9 @@ tags = {
 | `patch-baselines.tf` | Patch baselines, patch groups, maintenance windows and their tasks |
 | `state-manager.tf` | Published Command documents and the State Manager associations that run them |
 | `documents/` | Run Command documents published to Systems Manager, one per file |
+| `inventory.tf` | Inventory collection, the hardened sync destination, and the resource data sync |
+| `compliance.tf` | Read-only compliance reporter, its notification topic, and its schedule |
+| `lambda/compliance-reporter/` | Function that turns compliance state into a digest |
 | `outputs.tf` | Identifiers other configurations and runbooks consume |
 
 ## Configuration convergence
@@ -87,6 +90,69 @@ state_manager_associations = {
 
 Systems Manager truncates the output it returns inline. Set `association_output_s3_bucket`
 to an existing bucket to keep the full log of every run.
+
+## Inventory and compliance
+
+Patching and convergence act on the fleet. Inventory answers the prior question — what is
+actually running out there — and compliance answers the operational one: which nodes are
+currently out of line, on what, and how badly.
+
+### Collection
+
+One inventory association covers the fleet. Systems Manager permits exactly one per
+managed node, so it is declared separately from the convergence associations rather than
+as another entry alongside them. Categories are configured as booleans:
+
+```hcl
+inventory_collection = {
+  applications                  = true
+  instance_detailed_information = true
+  network_config                = true
+  services                      = true
+  billing_info                  = false
+
+  # File and registry collection are JSON documents, not flags. Left unset, neither is
+  # collected — they are the categories that grow inventory volume fastest.
+  files = jsonencode([{ Path = "/etc", Pattern = ["*.conf"], Recursive = false }])
+}
+```
+
+### Where the data goes
+
+Systems Manager keeps inventory for a limited window, which is long enough to answer a
+question and too short to see a trend. The resource data sync copies inventory and
+compliance data into S3 continuously, so fleet history survives and can be read with
+ordinary data tools rather than through the API.
+
+The destination bucket is created and hardened here unless `inventory_sync_bucket_name`
+points at an existing one: object ownership enforced, public access blocked, versioning
+on, encrypted with a rotating customer managed key, TLS required, and lifecycle expiry at
+`inventory_retention_days`. The bucket policy grants Systems Manager exactly the write it
+needs — scoped to the sync prefix and to this account's partition of it, nothing wider.
+
+### The compliance digest
+
+| | |
+|---|---|
+| What it reports | Fleet-wide compliant and non-compliant counts per compliance type, then the specific nodes failing at the severities you asked for |
+| How it is delivered | A JSON report object under a date partition, plus a truncated digest published to a topic |
+| How often | `compliance_report_schedule_expression`, weekly by default |
+| What it changes | Nothing |
+
+The reporter is read only by construction. It lists compliance state, writes its own
+report object, and publishes a message — it never remediates a node, retriggers an
+association, or changes a baseline. Remediation stays a deliberate act: a maintenance
+window that installs patches, or an association switched on after review.
+
+```hcl
+compliance_report_severities        = ["CRITICAL", "HIGH"]
+compliance_notification_emails      = ["platform-oncall@example.invalid"]
+compliance_max_resources_in_summary = 25
+```
+
+Findings are ordered worst-first — severity, then how many items are failing — and the
+published message is capped so a bad week does not produce an unreadable email. The full
+set always stays in the report object.
 
 ## Getting started
 
@@ -141,6 +207,9 @@ module "fleet" {
 - **Idempotent convergence.** A document run against a node already in the declared state
   makes no change and succeeds, so a short association interval is safe. A node that did
   not converge exits non-zero and shows up as non-compliant.
+- **Reporting never remediates.** The compliance reporter only reads state and publishes
+  it. Anything that changes a node is an explicit, reviewable action elsewhere in this
+  configuration.
 - **Templates, not device operations.** This repository ships infrastructure as code with
   placeholder values; it is never executed against a live account from here.
 

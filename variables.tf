@@ -606,3 +606,357 @@ variable "association_output_s3_key_prefix" {
     error_message = "association_output_s3_key_prefix must be a valid S3 key prefix."
   }
 }
+
+################################################################################
+# Inventory
+################################################################################
+
+variable "enable_inventory" {
+  description = <<-EOT
+    Whether to schedule inventory collection across the fleet. Systems Manager permits
+    exactly one inventory association per managed node, so leave this off if inventory is
+    already scheduled for these nodes by another configuration.
+  EOT
+  type        = bool
+  default     = true
+}
+
+variable "inventory_schedule_expression" {
+  description = "How often managed nodes report inventory. Daily collection is enough for software and configuration drift."
+  type        = string
+  default     = "rate(1 day)"
+
+  validation {
+    condition     = can(regex("^(cron|rate)\\(.+\\)$", var.inventory_schedule_expression))
+    error_message = "inventory_schedule_expression must be a cron(...) or rate(...) expression."
+  }
+}
+
+variable "inventory_compliance_severity" {
+  description = "Severity recorded when a node fails to report inventory."
+  type        = string
+  default     = "MEDIUM"
+
+  validation {
+    condition = contains(
+      ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFORMATIONAL", "UNSPECIFIED"],
+      var.inventory_compliance_severity,
+    )
+    error_message = "inventory_compliance_severity must be one of CRITICAL, HIGH, MEDIUM, LOW, INFORMATIONAL, UNSPECIFIED."
+  }
+}
+
+variable "inventory_targets" {
+  description = <<-EOT
+    Nodes that report inventory. The default covers every managed node in the region,
+    which is normally what you want: inventory is read-only metadata collection, and a
+    node missing from inventory is a node you cannot reason about.
+  EOT
+
+  type = list(object({
+    key    = string
+    values = list(string)
+  }))
+
+  default = [
+    {
+      key    = "InstanceIds"
+      values = ["*"]
+    },
+  ]
+
+  validation {
+    condition     = length(var.inventory_targets) > 0
+    error_message = "inventory_targets must declare at least one target."
+  }
+
+  validation {
+    condition = alltrue([
+      for t in var.inventory_targets :
+      length(t.key) > 0 && length(t.values) > 0 && length(t.values) <= 50
+    ])
+    error_message = "Each inventory target must carry a key and between 1 and 50 values."
+  }
+}
+
+variable "inventory_collection" {
+  description = <<-EOT
+    Categories of inventory each node collects. The defaults gather the metadata that
+    answers most fleet questions — what is installed, what is running, and how the host is
+    connected — without the volume that file and registry collection adds.
+
+    files and windows_registry are JSON documents describing the paths or keys to collect,
+    not flags. Leave them null to collect neither.
+  EOT
+
+  type = object({
+    applications                  = optional(bool, true)
+    aws_components                = optional(bool, true)
+    billing_info                  = optional(bool, false)
+    custom_inventory              = optional(bool, true)
+    instance_detailed_information = optional(bool, true)
+    network_config                = optional(bool, true)
+    services                      = optional(bool, true)
+    windows_roles                 = optional(bool, true)
+    windows_updates               = optional(bool, true)
+    files                         = optional(string)
+    windows_registry              = optional(string)
+  })
+
+  default = {}
+
+  validation {
+    condition     = var.inventory_collection.files == null || can(jsondecode(var.inventory_collection.files))
+    error_message = "inventory_collection.files must be a JSON document describing the paths to collect."
+  }
+
+  validation {
+    condition     = var.inventory_collection.windows_registry == null || can(jsondecode(var.inventory_collection.windows_registry))
+    error_message = "inventory_collection.windows_registry must be a JSON document describing the keys to collect."
+  }
+}
+
+variable "enable_resource_data_sync" {
+  description = <<-EOT
+    Whether to sync inventory and compliance data to S3. Systems Manager only retains this
+    data for a limited window, so the sync is what turns fleet state into history that can
+    be queried with ordinary data tools.
+  EOT
+  type        = bool
+  default     = true
+}
+
+variable "inventory_sync_bucket_name" {
+  description = "Optional existing bucket that receives synced inventory data. Leave null to have this configuration create and harden one."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.inventory_sync_bucket_name == null || can(regex("^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$", var.inventory_sync_bucket_name))
+    error_message = "inventory_sync_bucket_name must be a valid S3 bucket name or null."
+  }
+}
+
+variable "inventory_sync_key_prefix" {
+  description = "Key prefix under which synced inventory data is written."
+  type        = string
+  default     = "ssm-inventory"
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9!_.*'()/-]{1,256}$", var.inventory_sync_key_prefix))
+    error_message = "inventory_sync_key_prefix must be a valid, non-empty S3 key prefix."
+  }
+}
+
+variable "create_inventory_sync_kms_key" {
+  description = "Whether to create a customer managed key for the sync destination. Only applies when this configuration creates the bucket."
+  type        = bool
+  default     = true
+}
+
+variable "inventory_sync_kms_key_arn" {
+  description = "Optional existing key ARN used to encrypt synced inventory data. Takes precedence over a key created here."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.inventory_sync_kms_key_arn == null || can(regex("^arn:aws[a-z-]*:kms:", var.inventory_sync_kms_key_arn))
+    error_message = "inventory_sync_kms_key_arn must be a KMS key ARN or null."
+  }
+}
+
+variable "inventory_kms_key_deletion_window_days" {
+  description = "Waiting period before a scheduled deletion of the inventory key completes."
+  type        = number
+  default     = 30
+
+  validation {
+    condition     = var.inventory_kms_key_deletion_window_days >= 7 && var.inventory_kms_key_deletion_window_days <= 30
+    error_message = "inventory_kms_key_deletion_window_days must be between 7 and 30."
+  }
+}
+
+variable "inventory_retention_days" {
+  description = "How long synced inventory objects are kept before expiry."
+  type        = number
+  default     = 365
+
+  validation {
+    condition     = var.inventory_retention_days >= 1 && var.inventory_retention_days <= 3653
+    error_message = "inventory_retention_days must be between 1 and 3653."
+  }
+}
+
+variable "inventory_noncurrent_retention_days" {
+  description = "How long superseded object versions are kept in the sync bucket."
+  type        = number
+  default     = 30
+
+  validation {
+    condition     = var.inventory_noncurrent_retention_days >= 1 && var.inventory_noncurrent_retention_days <= 3653
+    error_message = "inventory_noncurrent_retention_days must be between 1 and 3653."
+  }
+}
+
+################################################################################
+# Compliance reporting
+################################################################################
+
+variable "enable_compliance_reporting" {
+  description = "Whether to create the read-only compliance reporter, its notification topic, and its schedule."
+  type        = bool
+  default     = true
+}
+
+variable "compliance_report_schedule_expression" {
+  description = "How often the fleet compliance digest is produced."
+  type        = string
+  default     = "cron(0 6 ? * MON *)"
+
+  validation {
+    condition     = can(regex("^(cron|rate)\\(.+\\)$", var.compliance_report_schedule_expression))
+    error_message = "compliance_report_schedule_expression must be a cron(...) or rate(...) expression."
+  }
+}
+
+variable "compliance_report_severities" {
+  description = <<-EOT
+    Overall severities a non-compliant resource must carry to appear in the report. The
+    default keeps the digest to what an operator would act on; the underlying data for
+    every severity is still in the resource data sync.
+  EOT
+  type        = list(string)
+  default     = ["CRITICAL", "HIGH"]
+
+  validation {
+    condition     = length(var.compliance_report_severities) > 0
+    error_message = "compliance_report_severities must list at least one severity."
+  }
+
+  validation {
+    condition = alltrue([
+      for s in var.compliance_report_severities :
+      contains(["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFORMATIONAL", "UNSPECIFIED"], s)
+    ])
+    error_message = "Each entry in compliance_report_severities must be a Systems Manager severity."
+  }
+}
+
+variable "compliance_report_s3_bucket" {
+  description = <<-EOT
+    Optional bucket that receives compliance report objects. Leave null to write reports
+    alongside inventory in the bucket this configuration creates. Set it when the sync
+    bucket was supplied externally and is not writable by this account's report function.
+  EOT
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.compliance_report_s3_bucket == null || can(regex("^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$", var.compliance_report_s3_bucket))
+    error_message = "compliance_report_s3_bucket must be a valid S3 bucket name or null."
+  }
+}
+
+variable "compliance_report_kms_key_arn" {
+  description = "Key used to encrypt report objects when they are written to a caller-supplied bucket."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.compliance_report_kms_key_arn == null || can(regex("^arn:aws[a-z-]*:kms:", var.compliance_report_kms_key_arn))
+    error_message = "compliance_report_kms_key_arn must be a KMS key ARN or null."
+  }
+}
+
+variable "compliance_report_key_prefix" {
+  description = "Key prefix under which compliance report objects are written."
+  type        = string
+  default     = "compliance-reports"
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9!_.*'()/-]{1,256}$", var.compliance_report_key_prefix))
+    error_message = "compliance_report_key_prefix must be a valid, non-empty S3 key prefix."
+  }
+}
+
+variable "compliance_notification_emails" {
+  description = "Addresses subscribed to the compliance digest. Each subscription must be confirmed from the address itself."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition = alltrue([
+      for e in var.compliance_notification_emails :
+      can(regex("^[^@[:space:]]+@[^@[:space:]]+\\.[a-zA-Z]{2,}$", e))
+    ])
+    error_message = "Each entry in compliance_notification_emails must be an email address."
+  }
+}
+
+variable "compliance_max_resources_in_summary" {
+  description = "Resources listed in the published digest. The full set always stays in the report object."
+  type        = number
+  default     = 25
+
+  validation {
+    condition     = var.compliance_max_resources_in_summary >= 1 && var.compliance_max_resources_in_summary <= 200
+    error_message = "compliance_max_resources_in_summary must be between 1 and 200."
+  }
+}
+
+variable "compliance_report_timeout_seconds" {
+  description = "Timeout for the compliance reporter. A large fleet pages through many compliance summaries."
+  type        = number
+  default     = 300
+
+  validation {
+    condition     = var.compliance_report_timeout_seconds >= 30 && var.compliance_report_timeout_seconds <= 900
+    error_message = "compliance_report_timeout_seconds must be between 30 and 900."
+  }
+}
+
+variable "compliance_report_memory_mb" {
+  description = "Memory allocated to the compliance reporter."
+  type        = number
+  default     = 512
+
+  validation {
+    condition     = var.compliance_report_memory_mb >= 128 && var.compliance_report_memory_mb <= 3008
+    error_message = "compliance_report_memory_mb must be between 128 and 3008."
+  }
+}
+
+variable "compliance_log_retention_days" {
+  description = "Retention for the compliance reporter log group."
+  type        = number
+  default     = 90
+
+  validation {
+    condition = contains([
+      1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653,
+    ], var.compliance_log_retention_days)
+    error_message = "compliance_log_retention_days must be a retention period CloudWatch Logs accepts."
+  }
+}
+
+variable "compliance_log_kms_key_arn" {
+  description = "Optional customer managed key ARN used to encrypt the compliance reporter log group."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.compliance_log_kms_key_arn == null || can(regex("^arn:aws[a-z-]*:kms:", var.compliance_log_kms_key_arn))
+    error_message = "compliance_log_kms_key_arn must be a KMS key ARN or null."
+  }
+}
+
+variable "compliance_log_level" {
+  description = "Python log level for the compliance reporter."
+  type        = string
+  default     = "INFO"
+
+  validation {
+    condition     = contains(["DEBUG", "INFO", "WARNING", "ERROR"], var.compliance_log_level)
+    error_message = "compliance_log_level must be DEBUG, INFO, WARNING, or ERROR."
+  }
+}

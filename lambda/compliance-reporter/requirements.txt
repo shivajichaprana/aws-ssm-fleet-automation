@@ -1,0 +1,3 @@
+# The Lambda runtime already provides boto3, so this function ships with no
+# dependencies of its own. Install this file only to run the checks locally.
+boto3>=1.34.0
