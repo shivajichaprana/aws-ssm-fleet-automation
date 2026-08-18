@@ -110,3 +110,53 @@ output "compliance_report_location" {
     prefix = local.compliance_report_prefix
   } : null
 }
+
+output "session_document_name" {
+  description = "Session document carrying the preferences, null when Session Manager is not managed here."
+  value       = one(aws_ssm_document.session_preferences[*].name)
+}
+
+output "session_log_bucket" {
+  description = "Bucket that receives session transcripts, whether created here or supplied."
+  value       = local.session_enabled ? local.session_bucket_name : null
+}
+
+output "session_log_key_prefix" {
+  description = "Key prefix under which session transcripts land."
+  value       = local.session_log_prefix
+}
+
+output "session_log_group_name" {
+  description = "Log group that receives streamed session output."
+  value       = one(aws_cloudwatch_log_group.session[*].name)
+}
+
+output "session_kms_key_arn" {
+  description = "Key encrypting session data, transcripts, and streamed output. Null when sessions rely on transport encryption only."
+  value       = local.session_kms_key_arn
+}
+
+output "session_operator_policy_arn" {
+  description = "Customer managed policy granting scoped interactive access to the fleet."
+  value       = one(aws_iam_policy.session_operator[*].arn)
+}
+
+output "session_port_forwarding_permitted" {
+  description = "Whether the operator policy permits tunnelling documents alongside recorded shells."
+  value       = var.allow_session_port_forwarding
+}
+
+output "automation_runbook_names" {
+  description = "Published Automation runbook names keyed by the file that defines them."
+  value       = { for key, runbook in aws_ssm_document.automation : key => runbook.name }
+}
+
+output "automation_runbook_arns" {
+  description = "Published Automation runbook ARNs keyed by the file that defines them."
+  value       = { for key, runbook in aws_ssm_document.automation : key => runbook.arn }
+}
+
+output "automation_role_arn" {
+  description = "Role Systems Manager Automation assumes to run the published runbooks."
+  value       = local.automation_role_arn
+}

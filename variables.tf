@@ -960,3 +960,301 @@ variable "compliance_log_level" {
     error_message = "compliance_log_level must be DEBUG, INFO, WARNING, or ERROR."
   }
 }
+
+################################################################################
+# Session Manager
+################################################################################
+
+variable "enable_session_manager" {
+  description = <<-EOT
+    Whether to manage Session Manager preferences and their logging destinations. Session
+    preferences are account-and-region wide, so leave this off if another configuration
+    already owns the session document for this region.
+  EOT
+  type        = bool
+  default     = true
+}
+
+variable "session_document_name" {
+  description = <<-EOT
+    Name of the Session document that carries the preferences. Systems Manager applies
+    the document named "SSM-SessionManagerRunShell" to every session automatically; a
+    document under any other name only applies to sessions that request it by name.
+  EOT
+  type        = string
+  default     = "SSM-SessionManagerRunShell"
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9_.-]{3,128}$", var.session_document_name))
+    error_message = "session_document_name must be 3-128 characters of letters, digits, underscore, dot, or hyphen."
+  }
+}
+
+variable "session_idle_timeout_minutes" {
+  description = "Idle time after which a session is terminated, so an abandoned shell does not stay open on a node."
+  type        = number
+  default     = 20
+
+  validation {
+    condition     = var.session_idle_timeout_minutes >= 1 && var.session_idle_timeout_minutes <= 60
+    error_message = "session_idle_timeout_minutes must be between 1 and 60."
+  }
+}
+
+variable "session_max_duration_minutes" {
+  description = "Hard ceiling on session length, applied even to a session that stays active."
+  type        = number
+  default     = 60
+
+  validation {
+    condition     = var.session_max_duration_minutes >= 1 && var.session_max_duration_minutes <= 1440
+    error_message = "session_max_duration_minutes must be between 1 and 1440."
+  }
+}
+
+variable "session_run_as_enabled" {
+  description = <<-EOT
+    Whether sessions run as the operating-system user named below instead of the default
+    ssm-user. Off by default: the named user must already exist on every node, and a
+    session that cannot resolve it fails to start.
+  EOT
+  type        = bool
+  default     = false
+}
+
+variable "session_run_as_default_user" {
+  description = "Operating-system user sessions run as when run-as is enabled."
+  type        = string
+  default     = "ssm-user"
+
+  validation {
+    condition     = can(regex("^[a-z_][a-z0-9_-]{0,31}$", var.session_run_as_default_user))
+    error_message = "session_run_as_default_user must be a valid POSIX user name."
+  }
+}
+
+variable "session_shell_profile" {
+  description = <<-EOT
+    Commands run at the start of every session, per platform. Useful for setting a prompt
+    that makes it obvious the shell is a recorded session. Leave an entry null to send no
+    profile for that platform.
+  EOT
+
+  type = object({
+    linux   = optional(string)
+    windows = optional(string)
+  })
+
+  default = {}
+
+  validation {
+    condition = alltrue([
+      for profile in [var.session_shell_profile.linux, var.session_shell_profile.windows] :
+      profile == null || length(profile) <= 8192
+    ])
+    error_message = "Each shell profile must be 8192 characters or fewer."
+  }
+}
+
+variable "session_log_bucket_name" {
+  description = <<-EOT
+    Optional existing bucket that receives completed session transcripts. Leave null to
+    create and harden one here.
+  EOT
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.session_log_bucket_name == null || can(regex("^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$", var.session_log_bucket_name))
+    error_message = "session_log_bucket_name must be a valid S3 bucket name or null."
+  }
+}
+
+variable "session_log_key_prefix" {
+  description = "Key prefix under which session transcripts are written."
+  type        = string
+  default     = "session-logs"
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9!_.*'()/-]{1,256}$", var.session_log_key_prefix))
+    error_message = "session_log_key_prefix must be a valid, non-empty S3 key prefix."
+  }
+}
+
+variable "session_log_retention_days" {
+  description = "How long session transcripts are kept in S3. Interactive access to production is normally an audit record worth keeping for a year."
+  type        = number
+  default     = 365
+
+  validation {
+    condition     = var.session_log_retention_days >= 1 && var.session_log_retention_days <= 3653
+    error_message = "session_log_retention_days must be between 1 and 3653."
+  }
+}
+
+variable "session_log_noncurrent_retention_days" {
+  description = "How long superseded versions of session transcripts are kept."
+  type        = number
+  default     = 30
+
+  validation {
+    condition     = var.session_log_noncurrent_retention_days >= 1 && var.session_log_noncurrent_retention_days <= 3653
+    error_message = "session_log_noncurrent_retention_days must be between 1 and 3653."
+  }
+}
+
+variable "session_cloudwatch_retention_days" {
+  description = "Retention for the log group that receives streamed session output."
+  type        = number
+  default     = 365
+
+  validation {
+    condition = contains([
+      1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653,
+    ], var.session_cloudwatch_retention_days)
+    error_message = "session_cloudwatch_retention_days must be a retention period CloudWatch Logs accepts."
+  }
+}
+
+variable "create_session_kms_key" {
+  description = <<-EOT
+    Whether to create a customer managed key for session data. Session Manager encrypts
+    the session itself with this key on top of the transport, and the same key encrypts
+    the transcript bucket and the streaming log group.
+  EOT
+  type        = bool
+  default     = true
+}
+
+variable "session_kms_key_arn" {
+  description = "Existing key used to encrypt session data instead of creating one. Takes precedence over create_session_kms_key."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.session_kms_key_arn == null || can(regex("^arn:aws[a-z-]*:kms:", var.session_kms_key_arn))
+    error_message = "session_kms_key_arn must be a KMS key ARN or null."
+  }
+}
+
+variable "session_kms_key_deletion_window_days" {
+  description = "Waiting period before the session key is deleted, if deletion is ever requested."
+  type        = number
+  default     = 30
+
+  validation {
+    condition     = var.session_kms_key_deletion_window_days >= 7 && var.session_kms_key_deletion_window_days <= 30
+    error_message = "session_kms_key_deletion_window_days must be between 7 and 30."
+  }
+}
+
+variable "session_key_user_role_arns" {
+  description = <<-EOT
+    Role ARNs granted use of the session key through the key policy. Both ends of a
+    session need it: the node's instance role to encrypt what it writes, and the operator's
+    role to decrypt what it reads. Nodes without this grant cannot start an encrypted
+    session.
+  EOT
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition = alltrue([
+      for arn in var.session_key_user_role_arns :
+      can(regex("^arn:aws[a-z-]*:iam::[0-9]{12}:role/.+$", arn))
+    ])
+    error_message = "Each entry in session_key_user_role_arns must be an IAM role ARN."
+  }
+}
+
+variable "create_session_operator_policy" {
+  description = "Whether to create the customer managed policy that grants scoped interactive access to the fleet."
+  type        = bool
+  default     = true
+}
+
+variable "session_access_tag_key" {
+  description = "Instance tag key an operator's session access is scoped by. A node without this tag cannot be connected to."
+  type        = string
+  default     = "Patch Group"
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9 +=._:/@-]{1,128}$", var.session_access_tag_key))
+    error_message = "session_access_tag_key must be a valid tag key."
+  }
+}
+
+variable "session_access_tag_values" {
+  description = <<-EOT
+    Tag values the operator policy permits sessions to. Compared with StringLike, so "*"
+    permits any node that carries the tag key at all while a narrower list confines
+    operators to a named slice of the fleet.
+  EOT
+  type        = list(string)
+  default     = ["*"]
+
+  validation {
+    condition     = length(var.session_access_tag_values) > 0
+    error_message = "session_access_tag_values must declare at least one value."
+  }
+}
+
+variable "allow_session_port_forwarding" {
+  description = <<-EOT
+    Whether the operator policy permits port forwarding and SSH tunnelling through Session
+    Manager. Off by default: a forwarded port carries traffic that the session transcript
+    does not record, which defeats the audit trail the rest of this configuration builds.
+  EOT
+  type        = bool
+  default     = false
+}
+
+################################################################################
+# Automation runbooks
+################################################################################
+
+variable "enable_automation_runbooks" {
+  description = "Whether to publish the Automation runbooks in automation/ and the role that runs them."
+  type        = bool
+  default     = true
+}
+
+variable "automation_role_arn" {
+  description = "Existing role Systems Manager Automation assumes to run the published runbooks. Leave null to create a least-privilege one."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.automation_role_arn == null || can(regex("^arn:aws[a-z-]*:iam::[0-9]{12}:role/.+$", var.automation_role_arn))
+    error_message = "automation_role_arn must be an IAM role ARN or null."
+  }
+}
+
+variable "automation_output_s3_bucket" {
+  description = <<-EOT
+    Optional bucket that receives full command output from runbook steps. Leave null to
+    keep runbook output inline, which Systems Manager truncates.
+  EOT
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.automation_output_s3_bucket == null || can(regex("^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$", var.automation_output_s3_bucket))
+    error_message = "automation_output_s3_bucket must be a valid S3 bucket name or null."
+  }
+}
+
+variable "automation_approval_topic_arn" {
+  description = <<-EOT
+    Optional topic notified when a runbook pauses for approval. Runbooks that change host
+    state take the topic as a parameter; this grants the automation role permission to
+    publish to it.
+  EOT
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.automation_approval_topic_arn == null || can(regex("^arn:aws[a-z-]*:sns:", var.automation_approval_topic_arn))
+    error_message = "automation_approval_topic_arn must be an SNS topic ARN or null."
+  }
+}

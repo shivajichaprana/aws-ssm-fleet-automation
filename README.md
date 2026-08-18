@@ -12,9 +12,10 @@ described as data and applied consistently across every node in the fleet.
 | Configuration convergence | State Manager associations that keep agents, packages, and settings at their declared state |
 | Inventory and compliance | Systems Manager Inventory with a resource data sync so fleet state is queryable outside the console |
 | Interactive access | Session Manager with hardened, audited logging in place of inbound SSH and bastion hosts |
+| Operational runbooks | Automation documents for the work that does not fit a schedule: out-of-window patching, node diagnostics, adopting the hardening baseline |
 
-Patch management, configuration convergence, and inventory ship today; interactive access
-lands in the same configuration and reuses the same tagging model.
+Every capability is described as data and reuses the same tagging model, so a node joins
+or leaves the fleet by how it is tagged rather than by an edit to this configuration.
 
 ## How nodes are selected
 
@@ -43,6 +44,9 @@ tags = {
 | `inventory.tf` | Inventory collection, the hardened sync destination, and the resource data sync |
 | `compliance.tf` | Read-only compliance reporter, its notification topic, and its schedule |
 | `lambda/compliance-reporter/` | Function that turns compliance state into a digest |
+| `session-manager.tf` | Session preferences, the hardened transcript bucket and log group, and the operator policy |
+| `automation.tf` | Published Automation runbooks and the role that runs them |
+| `automation/` | Automation runbooks published to Systems Manager, one per file |
 | `outputs.tf` | Identifiers other configurations and runbooks consume |
 
 ## Configuration convergence
@@ -154,6 +158,83 @@ Findings are ordered worst-first — severity, then how many items are failing �
 published message is capped so a bad week does not produce an unreadable email. The full
 set always stays in the report object.
 
+## Interactive access
+
+Session Manager exists here to make inbound SSH unnecessary: no bastion, no open port 22,
+no long-lived key material on a node. What replaces them is a session that is
+authenticated, authorised by tag, encrypted, and recorded.
+
+Session preferences are account-and-region wide — Systems Manager reads the document named
+`SSM-SessionManagerRunShell` for every session started in the region — so publishing them
+is what makes logging non-optional for anyone who connects. Set
+`enable_session_manager = false` where another configuration already owns that document.
+
+### Where a session is recorded
+
+| Destination | What it is for |
+|---|---|
+| S3 transcript bucket | The archive. Versioned, encrypted, TLS-only, lifecycle expiry at `session_log_retention_days` |
+| CloudWatch log group | The live view. Streamed as the session happens, encrypted with the same key |
+
+Both are on. They answer different questions: the log group is where a session in progress
+is watched, the bucket is where a session from six months ago is read back. The bucket is
+created and hardened here unless `session_log_bucket_name` points at an existing one.
+
+### Who may connect to what
+
+Access is granted by tag, never by instance ID. The operator policy permits
+`ssm:StartSession` only to nodes carrying `session_access_tag_key` with a value matching
+`session_access_tag_values`, and only through the reviewed preferences document.
+
+```hcl
+session_access_tag_key       = "Patch Group"
+session_access_tag_values    = ["linux-non-production"]
+session_idle_timeout_minutes = 20
+session_max_duration_minutes = 60
+session_key_user_role_arns   = ["arn:aws:iam::123456789012:role/fleet-node"]
+```
+
+Port forwarding is denied by default. Traffic through a forwarded port never reaches the
+transcript, which defeats the audit trail the rest of this configuration builds — set
+`allow_session_port_forwarding = true` where that trade-off has been accepted.
+
+Both ends of an encrypted session need to use the session key: the node's instance role to
+encrypt what it writes, the operator's role to decrypt what it reads. Roles listed in
+`session_key_user_role_arns` are granted that use through the key policy.
+
+## Operational runbooks
+
+Some work does not fit a schedule. A patch that cannot wait for the next window, a node
+that stopped converging, the hardening baseline that ships switched off and is adopted once
+somebody has decided to. Writing those down as Automation documents rather than as shell
+history is what makes them reviewable, repeatable, and runnable by somebody who was not
+there the first time.
+
+Every `*.yml` file in [`automation/`](automation/) is published as an Automation document,
+so a runbook is added by adding a file.
+
+| Runbook | What it does | Changes state | Approval |
+|---|---|---|---|
+| `patch-on-demand` | Scans a slice, pauses for approval, installs, re-reports patch state | Yes | Default on, can be waived |
+| `collect-node-diagnostics` | Confirms a node is reachable and returns its diagnostics inline | No | Not applicable |
+| `apply-hardening-baseline` | Snapshots a slice, gets approval, applies hardening, verifies nodes still answer | Yes | Mandatory |
+
+```bash
+aws ssm start-automation-execution \
+  --document-name "fleet-patch-on-demand" \
+  --parameters '{
+    "TargetTagValue": ["linux-non-production"],
+    "AutomationAssumeRole": ["arn:aws:iam::123456789012:role/fleet-automation"],
+    "ApprovalTopicArn": ["arn:aws:sns:us-east-1:123456789012:fleet-change-approvals"],
+    "Approvers": ["arn:aws:iam::123456789012:role/platform-oncall"]
+  }'
+```
+
+The role the runbooks assume is created here and is deliberately narrow: commands may only
+be sent to nodes carrying the patch-group tag, and only through this fleet's own documents
+or the AWS patch document, so a runbook cannot be edited into a general-purpose remote
+shell.
+
 ## Getting started
 
 ```bash
@@ -210,6 +291,12 @@ module "fleet" {
 - **Reporting never remediates.** The compliance reporter only reads state and publishes
   it. Anything that changes a node is an explicit, reviewable action elsewhere in this
   configuration.
+- **Access is recorded, not trusted.** Interactive access is authorised by tag, bounded by
+  an idle and a maximum duration, encrypted, and written to an archive the operator can
+  read but cannot rewrite.
+- **Change passes through approval.** A runbook that rewrites host configuration captures
+  the state before, waits for an approver, and verifies the fleet afterwards. It expires
+  rather than proceeding when nobody approves.
 - **Templates, not device operations.** This repository ships infrastructure as code with
   placeholder values; it is never executed against a live account from here.
 

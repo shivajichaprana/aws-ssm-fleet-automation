@@ -1,0 +1,189 @@
+schemaVersion: '0.3'
+description: |-
+  Applies the host hardening baseline to a tag-selected slice of the fleet, through an
+  approval gate and with a verification pass on either side.
+
+  The hardening document rewrites host configuration — remote root login, password
+  authentication, legacy SMB — so it ships as an association that is described but not
+  switched on. This runbook is the reviewable way to apply it: capture the state before,
+  get an explicit approval, converge the slice, then confirm the nodes still answer.
+
+  Approval is mandatory here. Unlike patching, there is no schedule this run is stepping
+  outside of; the change is only ever made because somebody decided to make it.
+assumeRole: '{{ AutomationAssumeRole }}'
+parameters:
+  AutomationAssumeRole:
+    type: String
+    description: Role Systems Manager Automation assumes to run this runbook.
+    default: ''
+    allowedPattern: ^$|^arn:aws[a-z-]*:iam::[0-9]{12}:role/.+$
+  TargetTagKey:
+    type: String
+    description: Instance tag key that selects the slice to harden.
+    default: Patch Group
+    allowedPattern: ^[A-Za-z0-9 +=._:/@-]{1,128}$
+  TargetTagValue:
+    type: String
+    description: Tag value that selects the slice to harden.
+    allowedPattern: ^[A-Za-z0-9 +=._:/@-]{1,256}$
+  HardeningDocumentName:
+    type: String
+    description: >-
+      Published hardening document to run. The name follows the configured prefix, so the
+      shipped default corresponds to a fleet deployed with the default prefix.
+    default: fleet-host-hardening
+    allowedPattern: ^[A-Za-z0-9_.-]{3,128}$
+  DiagnosticsDocumentName:
+    type: String
+    description: Published diagnostics document used for the pre-change and post-change passes.
+    default: fleet-fleet-diagnostics
+    allowedPattern: ^[A-Za-z0-9_.-]{3,128}$
+  PermitRootLogin:
+    type: String
+    description: Value the ssh daemon setting is converged to on Linux nodes.
+    default: 'no'
+    allowedValues:
+      - 'no'
+      - prohibit-password
+  PasswordAuthentication:
+    type: String
+    description: Whether password authentication remains available on Linux nodes.
+    default: 'no'
+    allowedValues:
+      - 'no'
+      - 'yes'
+  ApprovalTopicArn:
+    type: String
+    description: Topic notified when the runbook pauses for approval.
+    default: ''
+    allowedPattern: ^$|^arn:aws[a-z-]*:sns:[a-z0-9-]+:[0-9]{12}:.+$
+  Approvers:
+    type: StringList
+    description: Principals permitted to approve the change, as IAM user or role ARNs.
+    default: []
+    allowedPattern: ^arn:aws[a-z-]*:iam::[0-9]{12}:(role|user)/.+$
+  MaxConcurrency:
+    type: String
+    description: >-
+      Nodes converged at once. Deliberately lower than the patch default: a configuration
+      change that locks operators out is worth discovering on one node.
+    default: 5%
+    allowedPattern: ^([1-9][0-9]{0,4}|100%|[1-9][0-9]?%)$
+  MaxErrors:
+    type: String
+    description: Failures tolerated before the run stops.
+    default: '1'
+    allowedPattern: ^([1-9][0-9]{0,4}|100%|[1-9][0-9]?%)$
+  CommandTimeoutSeconds:
+    type: String
+    description: Time allowed for each command across the slice.
+    default: '1800'
+    allowedPattern: ^[1-9][0-9]{2,4}$
+  OutputS3BucketName:
+    type: String
+    description: Bucket that receives full command output. Leave empty to keep output inline.
+    default: ''
+    allowedPattern: ^$|^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$
+mainSteps:
+  - name: captureStateBeforeChange
+    action: aws:runCommand
+    onFailure: Continue
+    description: >-
+      Records what the slice looked like before anything was touched. Allowed to fail: a
+      node that is already degraded is exactly the node worth knowing about, and the
+      approver should see that before deciding.
+    inputs:
+      DocumentName: '{{ DiagnosticsDocumentName }}'
+      Targets:
+        - Key: 'tag:{{ TargetTagKey }}'
+          Values:
+            - '{{ TargetTagValue }}'
+      MaxConcurrency: '{{ MaxConcurrency }}'
+      MaxErrors: 100%
+      TimeoutSeconds: '{{ CommandTimeoutSeconds }}'
+      OutputS3BucketName: '{{ OutputS3BucketName }}'
+    outputs:
+      - Name: CommandId
+        Selector: $.CommandId
+        Type: String
+      - Name: Status
+        Selector: $.Status
+        Type: String
+
+  - name: requestApproval
+    action: aws:approve
+    onFailure: Abort
+    timeoutSeconds: 3600
+    description: >-
+      Holds the run until an approver signs off. A configuration change that alters how
+      operators reach a host does not proceed on a timeout.
+    inputs:
+      NotificationArn: '{{ ApprovalTopicArn }}'
+      Message: >-
+        Approve applying the host hardening baseline to nodes tagged
+        {{ TargetTagKey }}={{ TargetTagValue }}. Remote root login will be set to
+        {{ PermitRootLogin }} and password authentication to {{ PasswordAuthentication }}.
+        Concurrency {{ MaxConcurrency }}, error budget {{ MaxErrors }}. The pre-change
+        snapshot ran as command {{ captureStateBeforeChange.CommandId }}.
+      MinRequiredApprovals: 1
+      Approvers: '{{ Approvers }}'
+
+  - name: applyHardening
+    action: aws:runCommand
+    onFailure: Abort
+    description: >-
+      Converges the slice onto the baseline. The document validates the candidate ssh
+      configuration before adopting it and reloads rather than restarts, so an established
+      session is not dropped by its own hardening run.
+    inputs:
+      DocumentName: '{{ HardeningDocumentName }}'
+      Targets:
+        - Key: 'tag:{{ TargetTagKey }}'
+          Values:
+            - '{{ TargetTagValue }}'
+      Parameters:
+        permitRootLogin:
+          - '{{ PermitRootLogin }}'
+        passwordAuthentication:
+          - '{{ PasswordAuthentication }}'
+      MaxConcurrency: '{{ MaxConcurrency }}'
+      MaxErrors: '{{ MaxErrors }}'
+      TimeoutSeconds: '{{ CommandTimeoutSeconds }}'
+      OutputS3BucketName: '{{ OutputS3BucketName }}'
+    outputs:
+      - Name: CommandId
+        Selector: $.CommandId
+        Type: String
+      - Name: Status
+        Selector: $.Status
+        Type: String
+
+  - name: verifyNodesStillRespond
+    action: aws:runCommand
+    onFailure: Abort
+    isEnd: true
+    description: >-
+      Confirms the slice still answers a command after the change. A node that hardened
+      itself out of reach fails here rather than being discovered later.
+    inputs:
+      DocumentName: '{{ DiagnosticsDocumentName }}'
+      Targets:
+        - Key: 'tag:{{ TargetTagKey }}'
+          Values:
+            - '{{ TargetTagValue }}'
+      MaxConcurrency: '{{ MaxConcurrency }}'
+      MaxErrors: 100%
+      TimeoutSeconds: '{{ CommandTimeoutSeconds }}'
+      OutputS3BucketName: '{{ OutputS3BucketName }}'
+    outputs:
+      - Name: CommandId
+        Selector: $.CommandId
+        Type: String
+      - Name: Status
+        Selector: $.Status
+        Type: String
+outputs:
+  - captureStateBeforeChange.CommandId
+  - applyHardening.CommandId
+  - applyHardening.Status
+  - verifyNodesStillRespond.Status

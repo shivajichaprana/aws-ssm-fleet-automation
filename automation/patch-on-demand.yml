@@ -1,0 +1,190 @@
+schemaVersion: '0.3'
+description: |-
+  Patches a tag-selected slice of the fleet outside its maintenance window, with the same
+  approval and rate-limiting discipline the scheduled path uses.
+
+  The runbook scans first, pauses for approval, installs, and re-reports patch state, so
+  the operator sees what will change before anything does and sees what actually changed
+  afterwards. Approval can be waived for a slice where that is appropriate — a
+  non-production patch group being brought current, for instance — but it is required by
+  default because this bypasses the schedule the fleet was patched on deliberately.
+
+  Nothing here targets an instance ID. The slice is chosen by tag, exactly as the
+  maintenance windows choose theirs.
+assumeRole: '{{ AutomationAssumeRole }}'
+parameters:
+  AutomationAssumeRole:
+    type: String
+    description: Role Systems Manager Automation assumes to run this runbook.
+    default: ''
+    allowedPattern: ^$|^arn:aws[a-z-]*:iam::[0-9]{12}:role/.+$
+  TargetTagKey:
+    type: String
+    description: >-
+      Instance tag key that selects the slice to patch. The final reporting step reads
+      patch state by patch group, so it only returns results for the "Patch Group" key.
+    default: Patch Group
+    allowedPattern: ^[A-Za-z0-9 +=._:/@-]{1,128}$
+  TargetTagValue:
+    type: String
+    description: Tag value that selects the slice to patch, for example linux-production.
+    allowedPattern: ^[A-Za-z0-9 +=._:/@-]{1,256}$
+  RebootOption:
+    type: String
+    description: >-
+      Whether nodes may reboot to finish installing a patch. NoReboot leaves patches that
+      require a restart in a pending state until the node is restarted separately.
+    default: RebootIfNeeded
+    allowedValues:
+      - RebootIfNeeded
+      - NoReboot
+  MaxConcurrency:
+    type: String
+    description: Nodes patched at once, as a count or a percentage of the slice.
+    default: 10%
+    allowedPattern: ^([1-9][0-9]{0,4}|100%|[1-9][0-9]?%)$
+  MaxErrors:
+    type: String
+    description: Failures tolerated before the run stops, as a count or a percentage.
+    default: 5%
+    allowedPattern: ^([1-9][0-9]{0,4}|100%|[1-9][0-9]?%)$
+  RequireApproval:
+    type: String
+    description: Whether to pause for approval between the scan and the install.
+    default: 'true'
+    allowedValues:
+      - 'true'
+      - 'false'
+  ApprovalTopicArn:
+    type: String
+    description: Topic notified when the runbook pauses for approval.
+    default: ''
+    allowedPattern: ^$|^arn:aws[a-z-]*:sns:[a-z0-9-]+:[0-9]{12}:.+$
+  Approvers:
+    type: StringList
+    description: Principals permitted to approve the install, as IAM user or role ARNs.
+    default: []
+    allowedPattern: ^arn:aws[a-z-]*:iam::[0-9]{12}:(role|user)/.+$
+  ScanTimeoutSeconds:
+    type: String
+    description: Time allowed for the scan across the whole slice.
+    default: '1800'
+    allowedPattern: ^[1-9][0-9]{2,4}$
+  InstallTimeoutSeconds:
+    type: String
+    description: Time allowed for the install across the whole slice.
+    default: '7200'
+    allowedPattern: ^[1-9][0-9]{2,4}$
+  OutputS3BucketName:
+    type: String
+    description: Bucket that receives full command output. Leave empty to keep output inline.
+    default: ''
+    allowedPattern: ^$|^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$
+mainSteps:
+  - name: scanBeforePatching
+    action: aws:runCommand
+    onFailure: Abort
+    description: >-
+      Reports what the baseline would install without changing anything, so the approval
+      below is given against a known state rather than an assumption.
+    inputs:
+      DocumentName: AWS-RunPatchBaseline
+      Targets:
+        - Key: 'tag:{{ TargetTagKey }}'
+          Values:
+            - '{{ TargetTagValue }}'
+      Parameters:
+        Operation:
+          - Scan
+        RebootOption:
+          - NoReboot
+      MaxConcurrency: '{{ MaxConcurrency }}'
+      MaxErrors: '{{ MaxErrors }}'
+      TimeoutSeconds: '{{ ScanTimeoutSeconds }}'
+      OutputS3BucketName: '{{ OutputS3BucketName }}'
+    outputs:
+      - Name: ScanCommandId
+        Selector: $.CommandId
+        Type: String
+      - Name: ScanStatus
+        Selector: $.Status
+        Type: String
+
+  - name: chooseApprovalPath
+    action: aws:branch
+    description: Sends the run through the approval gate unless approval was explicitly waived.
+    inputs:
+      Choices:
+        - NextStep: requestApproval
+          Variable: '{{ RequireApproval }}'
+          StringEquals: 'true'
+      Default: installPatches
+
+  - name: requestApproval
+    action: aws:approve
+    onFailure: Abort
+    timeoutSeconds: 3600
+    description: >-
+      Holds the run until an approver signs off. The execution expires rather than
+      proceeding if nobody does, so an unattended request never turns into an unattended
+      patch.
+    inputs:
+      NotificationArn: '{{ ApprovalTopicArn }}'
+      Message: >-
+        Approve an out-of-window patch install for nodes tagged {{ TargetTagKey }}={{ TargetTagValue }}.
+        Reboot option {{ RebootOption }}, concurrency {{ MaxConcurrency }}, error budget {{ MaxErrors }}.
+        The pre-install scan ran as command {{ scanBeforePatching.ScanCommandId }}.
+      MinRequiredApprovals: 1
+      Approvers: '{{ Approvers }}'
+    nextStep: installPatches
+
+  - name: installPatches
+    action: aws:runCommand
+    onFailure: Abort
+    description: >-
+      Installs approved patches under the same concurrency ceiling and error budget the
+      scheduled windows use, so a bad patch stops inside the budget instead of sweeping
+      the slice.
+    inputs:
+      DocumentName: AWS-RunPatchBaseline
+      Targets:
+        - Key: 'tag:{{ TargetTagKey }}'
+          Values:
+            - '{{ TargetTagValue }}'
+      Parameters:
+        Operation:
+          - Install
+        RebootOption:
+          - '{{ RebootOption }}'
+      MaxConcurrency: '{{ MaxConcurrency }}'
+      MaxErrors: '{{ MaxErrors }}'
+      TimeoutSeconds: '{{ InstallTimeoutSeconds }}'
+      OutputS3BucketName: '{{ OutputS3BucketName }}'
+    outputs:
+      - Name: InstallCommandId
+        Selector: $.CommandId
+        Type: String
+      - Name: InstallStatus
+        Selector: $.Status
+        Type: String
+
+  - name: reportPatchState
+    action: aws:executeAwsApi
+    onFailure: Continue
+    isEnd: true
+    description: >-
+      Reads back the patch state Systems Manager now holds for the slice. Reporting is
+      best effort: the install has already happened, and a failure to summarise it should
+      not mark the run as failed.
+    inputs:
+      Service: ssm
+      Api: DescribeInstancePatchStatesForPatchGroup
+      PatchGroup: '{{ TargetTagValue }}'
+    outputs:
+      - Name: InstancePatchStates
+        Selector: $.InstancePatchStates
+        Type: MapList
+outputs:
+  - scanBeforePatching.ScanCommandId
+  - installPatches.InstallCommandId
+  - reportPatchState.InstancePatchStates

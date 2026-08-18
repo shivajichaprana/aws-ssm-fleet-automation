@@ -1,0 +1,152 @@
+schemaVersion: '0.3'
+description: |-
+  Gathers a read-only picture of one managed node: what Systems Manager knows about it,
+  and what the node says about itself.
+
+  This is the first thing to run when a node is reported as unhealthy or has stopped
+  converging. It confirms the node is actually reachable through Systems Manager, then
+  runs the fleet diagnostics document on it and returns the output inline, so the answer
+  arrives without anyone opening a session.
+
+  The runbook changes nothing. Every step is a describe or a read-only command, which is
+  what makes it safe to run against production while an incident is open.
+assumeRole: '{{ AutomationAssumeRole }}'
+parameters:
+  AutomationAssumeRole:
+    type: String
+    description: Role Systems Manager Automation assumes to run this runbook.
+    default: ''
+    allowedPattern: ^$|^arn:aws[a-z-]*:iam::[0-9]{12}:role/.+$
+  InstanceId:
+    type: String
+    description: Managed node to collect diagnostics from.
+    allowedPattern: ^(i-[0-9a-f]{8,17}|mi-[0-9a-f]{8,17})$
+  DiagnosticsDocumentName:
+    type: String
+    description: >-
+      Published diagnostics document to run. The name follows the configured prefix, so
+      the shipped default corresponds to a fleet deployed with the default prefix.
+    default: fleet-fleet-diagnostics
+    allowedPattern: ^[A-Za-z0-9_.-]{3,128}$
+  LinuxMountPoint:
+    type: String
+    description: Filesystem the diagnostics document reports utilisation for on Linux nodes.
+    default: /
+    allowedPattern: ^/[A-Za-z0-9._/-]{0,63}$
+  UtilisationWarnPercent:
+    type: String
+    description: Utilisation at or above which the node reports itself as degraded.
+    default: '85'
+    allowedPattern: ^([1-9][0-9]?|100)$
+  CommandTimeoutSeconds:
+    type: String
+    description: Time allowed for the diagnostics command to complete.
+    default: '600'
+    allowedPattern: ^[1-9][0-9]{2,4}$
+  OutputS3BucketName:
+    type: String
+    description: Bucket that receives full command output. Leave empty to keep output inline.
+    default: ''
+    allowedPattern: ^$|^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$
+mainSteps:
+  - name: describeManagedNode
+    action: aws:executeAwsApi
+    onFailure: Abort
+    description: >-
+      Answers the question that decides everything after it: does Systems Manager know
+      about this node at all, and what does it think the node is running?
+    inputs:
+      Service: ssm
+      Api: DescribeInstanceInformation
+      Filters:
+        - Key: InstanceIds
+          Values:
+            - '{{ InstanceId }}'
+    outputs:
+      - Name: PingStatus
+        Selector: $.InstanceInformationList[0].PingStatus
+        Type: String
+      - Name: PlatformType
+        Selector: $.InstanceInformationList[0].PlatformType
+        Type: String
+      - Name: PlatformName
+        Selector: $.InstanceInformationList[0].PlatformName
+        Type: String
+      - Name: AgentVersion
+        Selector: $.InstanceInformationList[0].AgentVersion
+        Type: String
+      - Name: LastPingDateTime
+        Selector: $.InstanceInformationList[0].LastPingDateTime
+        Type: String
+
+  - name: assertNodeIsOnline
+    action: aws:assertAwsResourceProperty
+    onFailure: Abort
+    description: >-
+      Stops here when the node is not currently reachable. A command sent to an offline
+      node queues rather than failing, which would turn a clear answer into a timeout.
+    inputs:
+      Service: ssm
+      Api: DescribeInstanceInformation
+      Filters:
+        - Key: InstanceIds
+          Values:
+            - '{{ InstanceId }}'
+      PropertySelector: $.InstanceInformationList[0].PingStatus
+      DesiredValues:
+        - Online
+
+  - name: runDiagnostics
+    action: aws:runCommand
+    onFailure: Continue
+    description: >-
+      Runs the fleet diagnostics document on the node. Failure is allowed through: the
+      document exits non-zero on a degraded host by design, and that result is the finding
+      rather than an error.
+    inputs:
+      DocumentName: '{{ DiagnosticsDocumentName }}'
+      InstanceIds:
+        - '{{ InstanceId }}'
+      Parameters:
+        linuxMountPoint:
+          - '{{ LinuxMountPoint }}'
+        utilisationWarnPercent:
+          - '{{ UtilisationWarnPercent }}'
+      TimeoutSeconds: '{{ CommandTimeoutSeconds }}'
+      OutputS3BucketName: '{{ OutputS3BucketName }}'
+    outputs:
+      - Name: CommandId
+        Selector: $.CommandId
+        Type: String
+      - Name: CommandStatus
+        Selector: $.Status
+        Type: String
+
+  - name: readDiagnosticsOutput
+    action: aws:executeAwsApi
+    onFailure: Continue
+    isEnd: true
+    description: >-
+      Returns what the node reported so the result is readable in the execution itself,
+      rather than only in the command history.
+    inputs:
+      Service: ssm
+      Api: GetCommandInvocation
+      CommandId: '{{ runDiagnostics.CommandId }}'
+      InstanceId: '{{ InstanceId }}'
+    outputs:
+      - Name: ResponseCode
+        Selector: $.ResponseCode
+        Type: Integer
+      - Name: StandardOutput
+        Selector: $.StandardOutputContent
+        Type: String
+      - Name: StandardError
+        Selector: $.StandardErrorContent
+        Type: String
+outputs:
+  - describeManagedNode.PingStatus
+  - describeManagedNode.PlatformName
+  - describeManagedNode.AgentVersion
+  - runDiagnostics.CommandStatus
+  - readDiagnosticsOutput.StandardOutput
