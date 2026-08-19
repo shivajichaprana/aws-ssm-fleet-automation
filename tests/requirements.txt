@@ -1,0 +1,4 @@
+# Test-only dependencies. Nothing here is deployed; the documents and runbooks are
+# published as text by Terraform and the Lambda code depends only on the runtime SDK.
+pytest>=8,<9
+PyYAML>=6,<7

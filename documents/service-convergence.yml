@@ -14,11 +14,13 @@ parameters:
     description: systemd unit names that must be enabled and running on Linux nodes.
     default:
       - amazon-ssm-agent
+    allowedPattern: ^[A-Za-z0-9@._-]{1,128}$
   windowsServices:
     type: StringList
     description: Windows service names that must be set to automatic start and running.
     default:
       - AmazonSSMAgent
+    allowedPattern: ^[A-Za-z0-9@._ -]{1,128}$
   enableOnBoot:
     type: String
     description: Whether a service that is running but not enabled at boot should be enabled.
