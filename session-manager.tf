@@ -63,7 +63,7 @@ locals {
     length(compact([
       try(var.session_shell_profile.linux, null),
       try(var.session_shell_profile.windows, null),
-    ])) == 0 ? {} : {
+      ])) == 0 ? {} : {
       shellProfile = {
         for platform, profile in {
           linux   = try(var.session_shell_profile.linux, null)

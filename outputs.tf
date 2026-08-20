@@ -105,7 +105,7 @@ output "compliance_topic_arn" {
 
 output "compliance_report_location" {
   description = "Bucket and prefix where compliance report objects are written, null when reports are notification only."
-  value       = local.compliance_report_to_s3 ? {
+  value = local.compliance_report_to_s3 ? {
     bucket = local.compliance_report_bucket
     prefix = local.compliance_report_prefix
   } : null
