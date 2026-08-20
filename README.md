@@ -4,6 +4,52 @@ Fleet operations for EC2 and hybrid managed nodes built on AWS Systems Manager, 
 as Terraform. Patching, configuration convergence, inventory, and interactive access are
 described as data and applied consistently across every node in the fleet.
 
+## Architecture at a glance
+
+```mermaid
+flowchart LR
+  subgraph cfg["Declared as data"]
+    v["variables.tf"]
+    d["documents/"]
+    r["automation/"]
+  end
+
+  subgraph ssm["Systems Manager"]
+    pb["Patch baselines<br/>+ patch groups"]
+    mw["Maintenance windows"]
+    sm["State Manager<br/>associations"]
+    iv["Inventory"]
+    sess["Session Manager"]
+    au["Automation runbooks"]
+  end
+
+  nodes["Managed nodes<br/>selected by tag"]
+
+  subgraph out["Durable output"]
+    logs["CloudWatch Logs"]
+    s3["S3: inventory sync<br/>+ session transcripts"]
+    sns["SNS: digest<br/>+ approvals"]
+  end
+
+  v --> pb & mw & sm & iv & sess
+  d --> sm
+  r --> au
+  pb --> mw
+  mw & sm & iv & sess & au --> nodes
+  mw --> logs
+  sess --> logs
+  iv --> s3
+  sess --> s3
+  nodes --> rep["Compliance reporter<br/>read only"]
+  rep --> sns
+  rep --> s3
+  au --> sns
+```
+
+Configuration is declared once and applied to whichever nodes carry the right tags. Every
+capability writes somewhere durable, and nothing that reports is allowed to change a node.
+See [docs/architecture.md](docs/architecture.md) for the component-by-component walkthrough.
+
 ## Capabilities
 
 | Capability | What it does |
@@ -31,6 +77,37 @@ tags = {
 }
 ```
 
+## Patch flow
+
+A patch reaches a node through four decisions, each owned by a different resource. Keeping
+them separate means the risk appetite for a patch lives in one place and the blast radius
+lives in another, so changing the schedule never changes what gets installed.
+
+```mermaid
+flowchart LR
+  A["Baseline<br/>approval rules"] --> B["Patch group<br/>tag value"]
+  B --> C["Maintenance window<br/>schedule + rate limit"]
+  C --> D["RUN_COMMAND task<br/>AWS-RunPatchBaseline"]
+  D --> E["Node reports<br/>patch state"]
+  E --> F["Daily scan<br/>refreshes compliance"]
+  F --> G["Weekly digest"]
+```
+
+| Decision | Owned by | Shipped default |
+|---|---|---|
+| Which patches are acceptable | Baseline approval rules | Security and critical fixes approved after 7 days, bug fixes after 21 |
+| Which nodes a baseline covers | `patch_groups` on the baseline, matched by the node's `Patch Group` tag | Four groups across Linux and Windows, production and non-production |
+| When the work runs | `maintenance_windows` | Three weekly windows, non-production Sunday and production Saturday, all UTC |
+| How fast it may sweep | `max_concurrency` and `max_errors` | 25% for non-production, 10% with a 2% error budget for production |
+
+A baseline marked `set_as_default` covers nodes that carry no patch group tag at all, so an
+untagged node is still measured against a baseline somebody reviewed rather than the
+AWS-managed one. Window tasks run with `cutoff_behavior = CANCEL_TASK`: work that has not
+started by the cutoff does not start, rather than running past the agreed window.
+
+Operating the cycle, including triage when a node does not come back clean, is written up
+in the [patch runbook](docs/patch-runbook.md).
+
 ## Repository layout
 
 | Path | Purpose |
@@ -48,6 +125,10 @@ tags = {
 | `automation.tf` | Published Automation runbooks and the role that runs them |
 | `automation/` | Automation runbooks published to Systems Manager, one per file |
 | `outputs.tf` | Identifiers other configurations and runbooks consume |
+| `tests/` | Offline schema, control-flow, and contract checks for every published document |
+| `docs/` | Architecture walkthrough and the patch runbook |
+| `Makefile` | Entry points for deploy, patch reporting, linting, and tests |
+| `.github/workflows/ci.yml` | Terraform validation and document schema lint on every change |
 
 ## Configuration convergence
 
@@ -238,14 +319,18 @@ shell.
 ## Getting started
 
 ```bash
-terraform init
-terraform plan
-terraform apply
+make init
+make plan
+make deploy
 ```
 
 The shipped defaults create Amazon Linux 2 and Windows baselines, four patch groups, and
 three weekly maintenance windows. Override `patch_baselines` and `maintenance_windows` to
 describe your own fleet.
+
+Once applied, `make patch-report` prints current patch compliance per patch group, and
+`make compliance-report` invokes the read-only reporter on demand rather than waiting for
+its schedule. `make help` lists every target.
 
 ```hcl
 module "fleet" {
@@ -274,6 +359,38 @@ module "fleet" {
 - An instance profile granting the node `AmazonSSMManagedInstanceCore`.
 - Network reachability to the Systems Manager endpoints, either through a NAT path or
   through interface VPC endpoints for `ssm`, `ssmmessages`, and `ec2messages`.
+
+## Validation
+
+Documents are published verbatim, so a defect in one ships as written. Everything that can
+be checked without an account is checked before it can merge.
+
+```bash
+make lint       # terraform fmt + tflint, document and workflow YAML
+make test       # document schema, control flow, cross-document contracts, script syntax
+make validate   # terraform fmt, init without a backend, validate
+make ci         # everything the pipeline runs, in pipeline order
+```
+
+The test suite reads documents from the working tree with the same glob Terraform uses, so
+a new document is covered the moment the file exists. It enforces the schema Systems
+Manager accepts, walks every runbook's control flow so a branch cannot point at a step that
+does not exist, resolves each runbook's document references and parameter values against
+the document that will receive them, and parses every rendered shell body. See
+[tests/README.md](tests/README.md) for the full list and its known limitations.
+
+`.github/workflows/ci.yml` runs the same gates on every push and pull request, with all
+action references pinned to commit SHAs.
+
+## Documentation
+
+| Document | Covers |
+|---|---|
+| [docs/architecture.md](docs/architecture.md) | Component model, how each capability is built, and the design decisions behind them |
+| [docs/patch-runbook.md](docs/patch-runbook.md) | Operating the patch cycle: routine checks, triage, policy changes, adopting the hardening baseline |
+| [documents/README.md](documents/README.md) | Conventions every published Command document follows |
+| [automation/README.md](automation/README.md) | The runbook catalogue |
+| [tests/README.md](tests/README.md) | What the offline suite enforces |
 
 ## Design principles
 
